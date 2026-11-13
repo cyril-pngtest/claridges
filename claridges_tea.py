@@ -14,11 +14,13 @@ Utilisation :
     python3 claridges_tea.py --test            # une verification de controle
     caffeinate -i python3 claridges_tea.py     # surveillance continue (Mac eveille)
     python3 claridges_tea.py --analyse         # analyse des changements
+    python3 claridges_tea.py --une-fois        # une verification puis arret (GitHub)
     Ajouter --date AAAA-MM-JJ pour une autre date (defaut : 2026-12-01)
 """
 import argparse
 import csv
 import json
+import os
 import random
 import statistics
 import subprocess
@@ -35,7 +37,7 @@ import requests
 DATE = "2026-12-01"
 GUESTS = 2
 FOYER_ID = "ahNzfnNldmVucm9vbXMtc2VjdXJlchwLEg9uaWdodGxvb3BfVmVudWUYgICWz5_fnQoM"
-NTFY_TOPIC = "claridges-tea-ct-8q4m2x7k"   # sujet a suivre dans l'app ntfy (facultatif)
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "claridges-tea-ct-8q4m2x7k"  # sujet ntfy
 HEADLESS = True        # passer a False si le site bloque le navigateur invisible
 INTERVAL_NORMAL = 7    # minutes entre deux verifications
 INTERVAL_FINAL = 3     # minutes, dans les 4 derniers jours avant la date
@@ -154,40 +156,58 @@ def ecrire_journal(horodatage, statut, instantane):
                     json.dumps(compact, separators=(",", ":"))])
 
 
+def lire_etat():
+    if not STATE.exists():
+        return None, 0
+    data = json.loads(STATE.read_text())
+    if isinstance(data, list):
+        return set(data), 0
+    return set(data["creneaux"]), data.get("echecs", 0)
+
+
+def ecrire_etat(creneaux, echecs):
+    STATE.write_text(json.dumps({"creneaux": sorted(creneaux), "echecs": echecs}))
+
+
+def tour(browser):
+    """Une verification : journal, comparaison, alerte."""
+    prev, echecs = lire_etat()
+    maintenant = datetime.now(LONDON)
+    try:
+        statut, libres, instantane = verifier(browser)
+    except Exception as e:
+        statut, libres, instantane = "erreur", [], {}
+        print("Erreur :", e)
+    if instantane:
+        ecrire_journal(maintenant, statut, instantane)
+    print(f"{maintenant:%d/%m %H:%M} (Londres) - {DATE} : {statut} - "
+          f"{', '.join(libres) or 'aucun creneau libre'}")
+
+    if statut in ("dispo", "complet"):
+        cur = set(libres)
+        nouveaux = cur - prev if prev is not None else cur
+        if nouveaux:
+            notifier("Tea time Claridge's : place libre",
+                     f"{DATE}, {GUESTS} pers. : {', '.join(sorted(nouveaux))} "
+                     "(heure de Londres). Reservez vite !")
+        ecrire_etat(cur, 0)
+    else:
+        echecs += 1
+        if echecs == 3:
+            notifier("Surveillance Claridge's",
+                     "3 verifications sans lecture du site : a verifier.")
+        ecrire_etat(prev or set(), echecs)
+
+
+def fin_surveillance():
+    return datetime.fromisoformat(DATE + "T18:00").replace(tzinfo=LONDON)
+
+
 def boucle(browser):
-    prev = set(json.loads(STATE.read_text())) if STATE.exists() else None
-    echecs = 0
-    fin = datetime.fromisoformat(DATE + "T18:00").replace(tzinfo=LONDON)
     print(f"Surveillance du {DATE} pour {GUESTS} personnes. Ctrl+C pour arreter.")
-    while datetime.now(LONDON) < fin:
-        maintenant = datetime.now(LONDON)
-        try:
-            statut, libres, instantane = verifier(browser)
-        except Exception as e:
-            statut, libres, instantane = "erreur", [], {}
-            print("Erreur :", e)
-        if instantane:
-            ecrire_journal(maintenant, statut, instantane)
-        print(f"{maintenant:%d/%m %H:%M} (Londres) - {DATE} : {statut} - "
-              f"{', '.join(libres) or 'aucun creneau libre'}")
-
-        if statut in ("dispo", "complet"):
-            echecs = 0
-            cur = set(libres)
-            nouveaux = cur - prev if prev is not None else cur
-            if nouveaux:
-                notifier("Tea time Claridge's : place libre",
-                         f"{DATE}, {GUESTS} pers. : {', '.join(sorted(nouveaux))} "
-                         "(heure de Londres). Reservez vite !")
-            prev = cur
-            STATE.write_text(json.dumps(sorted(cur)))
-        else:
-            echecs += 1
-            if echecs == 3:
-                notifier("Surveillance Claridge's",
-                         "3 verifications sans lecture du site : a verifier.")
-
-        jours = (fin - datetime.now(LONDON)).days
+    while datetime.now(LONDON) < fin_surveillance():
+        tour(browser)
+        jours = (fin_surveillance() - datetime.now(LONDON)).days
         minutes = INTERVAL_FINAL if jours <= 4 else INTERVAL_NORMAL
         time.sleep(max(60, minutes * 60 + random.randint(-60, 60)))
     print("Date passee, fin de la surveillance.")
@@ -291,6 +311,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="une verification de controle")
     ap.add_argument("--analyse", action="store_true", help="analyse du journal")
+    ap.add_argument("--une-fois", action="store_true", help="une seule verification (serveur)")
     ap.add_argument("--date", help="date a surveiller, AAAA-MM-JJ (defaut : 2026-12-01)")
     args = ap.parse_args()
     if args.date:
@@ -319,6 +340,11 @@ def main():
                 if len(dispo) > 10:
                     print("  ...")
                 notifier("Test Claridge's", "Les notifications fonctionnent.")
+            elif args.une_fois:
+                if datetime.now(LONDON) < fin_surveillance():
+                    tour(browser)
+                else:
+                    print("Date passee, rien a faire.")
             else:
                 boucle(browser)
         finally:
